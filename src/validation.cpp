@@ -65,6 +65,7 @@
 #include <util/signalinterrupt.h>
 #include <util/strencodings.h>
 #include <util/string.h>
+#include <util/thread.h>
 #include <util/time.h>
 #include <util/trace.h>
 #include <util/translation.h>
@@ -5203,13 +5204,71 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
     }
 
     Chainstate* bg_chain{WITH_LOCK(cs_main, return BackgroundSyncInProgress() ? m_ibd_chainstate.get() : nullptr)};
-    BlockValidationState bg_state;
-    if (bg_chain && !bg_chain->ActivateBestChain(bg_state, block)) {
-        LogError("%s: [background] ActivateBestChain failed (%s)\n", __func__, bg_state.ToString());
-        return false;
-     }
+    if (bg_chain && m_bg_validation_running) {
+        // Hand the background chainstate's work to the "bgvalidation" thread so that this caller (normally the P2P
+        // message handler) returns to processing messages, including new tip blocks, right away.
+        {
+            LOCK(m_bg_validation_mutex);
+            m_bg_validation_pending = true;
+        }
+        m_bg_validation_cv.notify_one();
+    } else if (bg_chain) {
+        BlockValidationState bg_state;
+        if (!bg_chain->ActivateBestChain(bg_state, block)) {
+            LogError("%s: [background] ActivateBestChain failed (%s)\n", __func__, bg_state.ToString());
+            return false;
+        }
+    }
 
     return true;
+}
+
+void ChainstateManager::StartBackgroundValidation()
+{
+    LOCK(m_bg_validation_mutex);
+    if (m_bg_validation_thread.joinable()) return;
+    m_bg_validation_stop = false;
+    m_bg_validation_pending = true; // pick up anything already downloaded
+    m_bg_validation_thread = std::thread(&util::TraceThread, "bgvalidation", [this] { BackgroundValidationLoop(); });
+    m_bg_validation_running = true;
+}
+
+void ChainstateManager::StopBackgroundValidation()
+{
+    // From here on ProcessNewBlock() works inline again; both paths are serialized by the chainstate's
+    // m_chainstate_mutex inside ActivateBestChain().
+    m_bg_validation_running = false;
+    std::thread thread;
+    {
+        LOCK(m_bg_validation_mutex);
+        m_bg_validation_stop = true;
+        thread = std::move(m_bg_validation_thread);
+    }
+    m_bg_validation_cv.notify_all();
+    if (thread.joinable()) thread.join();
+}
+
+void ChainstateManager::BackgroundValidationLoop()
+{
+    while (true) {
+        {
+            WAIT_LOCK(m_bg_validation_mutex, lock);
+            // Wake on a request or on stop; the timeout only bounds how long a stop request can go unnoticed.
+            m_bg_validation_cv.wait_for(lock, std::chrono::seconds{1}, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_bg_validation_mutex) {
+                return m_bg_validation_pending || m_bg_validation_stop;
+            });
+            if (m_bg_validation_stop) return;
+            if (!m_bg_validation_pending) continue;
+            m_bg_validation_pending = false;
+        }
+        if (m_interrupt) return;
+        Chainstate* bg_chain{WITH_LOCK(::cs_main, return BackgroundSyncInProgress() ? m_ibd_chainstate.get() : nullptr)};
+        if (!bg_chain) continue;
+        BlockValidationState bg_state;
+        if (!bg_chain->ActivateBestChain(bg_state, nullptr)) {
+            LogError("[background] ActivateBestChain failed (%s)\n", bg_state.ToString());
+        }
+    }
 }
 
 MempoolAcceptResult ChainstateManager::ProcessTransaction(const CTransactionRef& tx, bool test_accept, const ignore_rejects_type& ignore_rejects)
@@ -7359,6 +7418,7 @@ ChainstateManager::ChainstateManager(const util::SignalInterrupt& interrupt, Opt
 
 ChainstateManager::~ChainstateManager()
 {
+    StopBackgroundValidation();
     LOCK(::cs_main);
 
     m_versionbitscache.Clear();

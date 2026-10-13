@@ -36,6 +36,7 @@
 #include <versionbits.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <optional>
@@ -43,6 +44,7 @@
 #include <span>
 #include <stdint.h>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -1087,6 +1089,26 @@ public:
     RecursiveMutex& GetMutex() const LOCK_RETURNED(::cs_main) { return ::cs_main; }
 
     const util::SignalInterrupt& m_interrupt;
+
+private:
+    //! assumeutxo background validation runs on its own "bgvalidation" thread instead of inside ProcessNewBlock(),
+    //! which is normally called from the P2P message handler: connecting a window of historical blocks can take
+    //! minutes on small machines, and the message handler must stay free to receive and connect new tip blocks.
+    Mutex m_bg_validation_mutex;
+    std::condition_variable m_bg_validation_cv;
+    bool m_bg_validation_pending GUARDED_BY(m_bg_validation_mutex){false};
+    bool m_bg_validation_stop GUARDED_BY(m_bg_validation_mutex){false};
+    std::thread m_bg_validation_thread GUARDED_BY(m_bg_validation_mutex);
+    std::atomic_bool m_bg_validation_running{false};
+    void BackgroundValidationLoop() EXCLUSIVE_LOCKS_REQUIRED(!m_bg_validation_mutex);
+
+public:
+    //! Start / stop the "bgvalidation" thread (node init / shutdown). Without it, ProcessNewBlock() advances the
+    //! background chainstate inline, as before.
+    void StartBackgroundValidation() EXCLUSIVE_LOCKS_REQUIRED(!m_bg_validation_mutex);
+    void StopBackgroundValidation() EXCLUSIVE_LOCKS_REQUIRED(!m_bg_validation_mutex);
+
+public:
     const Options m_options;
     //! A single BlockManager instance is shared across each constructed
     //! chainstate to avoid duplicating block metadata.
