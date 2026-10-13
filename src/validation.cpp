@@ -4038,6 +4038,7 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
             // Notify external listeners about the new tip.
             // Enqueue while holding cs_main to ensure that UpdatedBlockTip is called in the order in which blocks are connected
             if (this == &m_chainman.ActiveChainstate() && pindexFork != pindexNewTip) {
+                m_chainman.m_active_tip_changed = SteadyClock::now().time_since_epoch().count();
                 // Notify ValidationInterface subscribers
                 if (m_chainman.m_options.signals) {
                     m_chainman.m_options.signals->UpdatedBlockTip(pindexNewTip, pindexFork, still_in_ibd);
@@ -4091,12 +4092,8 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
         // caused an assert() failure during interrupt in such cases as the UTXO DB flushing checks
         // that the best block hash is non-null.
         if (m_chainman.m_interrupt) break;
-        if (is_background) {
-            // cs_main is not a fair lock: re-taking it right away for the next historical block can keep a waiting
-            // thread (the P2P message handler with a new tip header or block) out for the whole backlog. Pause
-            // briefly so waiters get it first. About 1 ms per historical block, minutes over a full background sync.
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
-        }
+        // New blocks first: between historical blocks the background chainstate gives way to the active one.
+        if (is_background) m_chainman.BackgroundYield();
     } while (pindexNewTip != pindexMostWork);
 
     m_chainman.CheckBlockIndex();
@@ -5255,8 +5252,53 @@ void ChainstateManager::StopBackgroundValidation()
     if (thread.joinable()) thread.join();
 }
 
+//! Set on the "bgvalidation" thread only: BackgroundYield() may wait there, never on a thread that could be the
+//! one that has to connect the newer block.
+static thread_local bool g_bgvalidation_thread{false};
+//! After the active tip moves: room for the new tip's block template (mining) and relay.
+static constexpr auto BG_YIELD_AFTER_TIP{std::chrono::seconds{10}};
+//! A newer header whose block does not arrive or connect stops holding the background chainstate back after this.
+static constexpr auto BG_YIELD_STALL{std::chrono::seconds{60}};
+static constexpr auto BG_YIELD_POLL{std::chrono::milliseconds{20}};
+
+void ChainstateManager::BackgroundYield()
+{
+    if (g_bgvalidation_thread) {
+        bool logged{false};
+        while (m_bg_validation_running && !m_interrupt) {
+            const auto now{SteadyClock::now()};
+            bool newer_block{false};
+            {
+                LOCK(::cs_main);
+                const CBlockIndex* tip{ActiveChain().Tip()};
+                const CBlockIndex* best{m_best_header};
+                if (tip && best && best->nChainWork > tip->nChainWork) {
+                    if (best != m_bg_yield_header || tip != m_bg_yield_tip) {
+                        m_bg_yield_header = best;
+                        m_bg_yield_tip = tip;
+                        m_bg_yield_since = now;
+                    }
+                    newer_block = now - m_bg_yield_since < BG_YIELD_STALL;
+                }
+            }
+            const auto changed{m_active_tip_changed.load()};
+            const bool settling{changed != 0 && now - SteadyClock::time_point{SteadyClock::duration{changed}} < BG_YIELD_AFTER_TIP};
+            if (!newer_block && !settling) break;
+            if (!logged) {
+                LogDebug(BCLog::VALIDATION, "[background validation] giving way to %s\n", newer_block ? "a newer block" : "the new tip");
+                logged = true;
+            }
+            std::this_thread::sleep_for(BG_YIELD_POLL);
+        }
+    }
+    // cs_main is not a fair lock: re-taking it right away for the next historical block can keep a waiting thread
+    // out for the whole backlog. Pause briefly so waiters get it first.
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+}
+
 void ChainstateManager::BackgroundValidationLoop()
 {
+    g_bgvalidation_thread = true;
     while (true) {
         {
             WAIT_LOCK(m_bg_validation_mutex, lock);

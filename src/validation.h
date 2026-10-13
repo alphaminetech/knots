@@ -1101,12 +1101,25 @@ private:
     std::thread m_bg_validation_thread GUARDED_BY(m_bg_validation_mutex);
     std::atomic_bool m_bg_validation_running{false};
     void BackgroundValidationLoop() EXCLUSIVE_LOCKS_REQUIRED(!m_bg_validation_mutex);
+    //! The newer header the background thread is giving way to, the active tip it last saw while doing so, and
+    //! since when (see BackgroundYield()).
+    const CBlockIndex* m_bg_yield_header GUARDED_BY(::cs_main){nullptr};
+    const CBlockIndex* m_bg_yield_tip GUARDED_BY(::cs_main){nullptr};
+    SteadyClock::time_point m_bg_yield_since GUARDED_BY(::cs_main){};
 
 public:
     //! Start / stop the "bgvalidation" thread (node init / shutdown). Without it, ProcessNewBlock() advances the
     //! background chainstate inline, as before.
     void StartBackgroundValidation() EXCLUSIVE_LOCKS_REQUIRED(!m_bg_validation_mutex);
     void StopBackgroundValidation() EXCLUSIVE_LOCKS_REQUIRED(!m_bg_validation_mutex);
+    //! When the active chainstate's tip last moved (SteadyClock ticks since its epoch; 0 = not yet).
+    std::atomic<SteadyClock::rep> m_active_tip_changed{0};
+    //! Called by the background chainstate between historical blocks. On the "bgvalidation" thread it waits
+    //! while the node knows a block with more work than the active tip (as long as the active chain keeps moving
+    //! towards it, at most BG_YIELD_STALL without progress) and for BG_YIELD_AFTER_TIP after the active tip moved,
+    //! so new blocks, block templates and relay are never queued behind historical blocks. Elsewhere it only
+    //! pauses for 1 ms.
+    void BackgroundYield() EXCLUSIVE_LOCKS_REQUIRED(!::cs_main);
 
 public:
     const Options m_options;
