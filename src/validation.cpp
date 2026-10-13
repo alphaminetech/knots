@@ -7400,6 +7400,9 @@ bool ChainstateManager::IsSnapshotActive() const
     return m_snapshot_chainstate && m_active_chainstate == m_snapshot_chainstate.get();
 }
 
+//! Share of the coins caches the active chainstate keeps while a background chainstate validates history.
+static constexpr double ACTIVE_CACHE_SHARE_DURING_BG{1.0 / 3};
+
 void ChainstateManager::MaybeRebalanceCaches()
 {
     AssertLockHeld(::cs_main);
@@ -7428,10 +7431,13 @@ void ChainstateManager::MaybeRebalanceCaches()
             m_snapshot_chainstate->ResizeCoinsCaches(
                 m_total_coinstip_cache * 0.95, m_total_coinsdb_cache * 0.95);
         } else {
+            // The active chainstate is the one that relays, mines on and connects new blocks. With 5% it had ~50 MB
+            // on a 4 GB node, so mempool checks, new blocks and block templates read from a disk the background
+            // chainstate keeps busy. It keeps a third while the background chainstate catches up.
             m_snapshot_chainstate->ResizeCoinsCaches(
-                m_total_coinstip_cache * 0.05, m_total_coinsdb_cache * 0.05);
+                m_total_coinstip_cache * ACTIVE_CACHE_SHARE_DURING_BG, m_total_coinsdb_cache * ACTIVE_CACHE_SHARE_DURING_BG);
             m_ibd_chainstate->ResizeCoinsCaches(
-                m_total_coinstip_cache * 0.95, m_total_coinsdb_cache * 0.95);
+                m_total_coinstip_cache * (1 - ACTIVE_CACHE_SHARE_DURING_BG), m_total_coinsdb_cache * (1 - ACTIVE_CACHE_SHARE_DURING_BG));
         }
     }
 }
