@@ -3959,6 +3959,7 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
     CBlockIndex *pindexMostWork = nullptr;
     CBlockIndex *pindexNewTip = nullptr;
     bool exited_ibd{false};
+    const bool is_background{WITH_LOCK(::cs_main, return GetRole() == ChainstateRole::BACKGROUND)};
     do {
         // Block until the validation queue drains. This should largely
         // never happen in normal operation, however may happen during
@@ -4090,6 +4091,12 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
         // caused an assert() failure during interrupt in such cases as the UTXO DB flushing checks
         // that the best block hash is non-null.
         if (m_chainman.m_interrupt) break;
+        if (is_background) {
+            // cs_main is not a fair lock: re-taking it right away for the next historical block can keep a waiting
+            // thread (the P2P message handler with a new tip header or block) out for the whole backlog. Pause
+            // briefly so waiters get it first. About 1 ms per historical block, minutes over a full background sync.
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
     } while (pindexNewTip != pindexMostWork);
 
     m_chainman.CheckBlockIndex();
