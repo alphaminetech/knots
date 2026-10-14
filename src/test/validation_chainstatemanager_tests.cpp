@@ -140,6 +140,17 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_rebalance_caches, TestChain100Setup)
     c2.InitCoinsDB(
         /*cache_size_bytes=*/1 << 23, /*in_memory=*/true, /*should_wipe=*/false);
 
+    // The fixture has already left IBD: active snapshot keeps one third.
+    {
+        LOCK(::cs_main);
+        c2.InitCoinsCache(1 << 23);
+        manager.MaybeRebalanceCaches();
+    }
+    BOOST_CHECK_CLOSE(double(c2.m_coinstip_cache_size_bytes), max_cache / 3.0, 1);
+    BOOST_CHECK_CLOSE(double(c2.m_coinsdb_cache_size_bytes), max_cache / 3.0, 1);
+    BOOST_CHECK_CLOSE(double(c1.m_coinstip_cache_size_bytes), max_cache * 2.0 / 3.0, 1);
+    BOOST_CHECK_CLOSE(double(c1.m_coinsdb_cache_size_bytes), max_cache * 2.0 / 3.0, 1);
+
     // Reset IBD state so IsInitialBlockDownload() returns true and causes
     // MaybeRebalancesCaches() to prioritize the snapshot chainstate, giving it
     // more cache space than the snapshot chainstate. Calling ResetIbd() is
