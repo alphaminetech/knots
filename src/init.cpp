@@ -2211,9 +2211,6 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         vImportFiles.push_back(fs::PathFromString(strFile));
     }
 
-    // Run assumeutxo background validation on its own thread so it never delays the processing of new tip blocks.
-    chainman.StartBackgroundValidation();
-
     node.background_init_thread = std::thread(&util::TraceThread, "initload", [=, &chainman, &args, &node] {
         ScheduleBatchPriority();
         // Import blocks and ActivateBestChain()
@@ -2226,6 +2223,12 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             }
             return;
         }
+
+        // Run assumeutxo background validation on its own thread from here on, so it never delays the processing
+        // of new tip blocks. Not before: ImportBlocks() activates every chainstate itself, and a background
+        // chainstate that completed on another thread meanwhile is disabled under it ("m_disabled is set").
+        // Shutdown() joins this thread before StopBackgroundValidation(), so start and stop cannot cross.
+        chainman.StartBackgroundValidation();
 
         // Start indexes initial sync
         if (!StartIndexBackgroundSync(node)) {
