@@ -334,6 +334,7 @@ void Shutdown(NodeContext& node)
     StopTorControl();
 
     if (node.background_init_thread.joinable()) node.background_init_thread.join();
+    if (node.chainman) node.chainman->StopBackgroundValidation();
     // After everything has been shut down, but before things get flushed, stop the
     // the scheduler. After this point, SyncWithValidationInterfaceQueue() should not be called anymore
     // as this would prevent the shutdown from completing.
@@ -2222,6 +2223,12 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             }
             return;
         }
+
+        // Run assumeutxo background validation on its own thread from here on, so it never delays the processing
+        // of new tip blocks. Not before: ImportBlocks() activates every chainstate itself, and a background
+        // chainstate that completed on another thread meanwhile is disabled under it ("m_disabled is set").
+        // Shutdown() joins this thread before StopBackgroundValidation(), so start and stop cannot cross.
+        chainman.StartBackgroundValidation();
 
         // Start indexes initial sync
         if (!StartIndexBackgroundSync(node)) {

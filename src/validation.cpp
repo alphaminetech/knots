@@ -65,6 +65,7 @@
 #include <util/signalinterrupt.h>
 #include <util/strencodings.h>
 #include <util/string.h>
+#include <util/thread.h>
 #include <util/time.h>
 #include <util/trace.h>
 #include <util/translation.h>
@@ -3958,6 +3959,7 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
     CBlockIndex *pindexMostWork = nullptr;
     CBlockIndex *pindexNewTip = nullptr;
     bool exited_ibd{false};
+    const bool is_background{WITH_LOCK(::cs_main, return GetRole() == ChainstateRole::BACKGROUND)};
     do {
         // Block until the validation queue drains. This should largely
         // never happen in normal operation, however may happen during
@@ -4036,6 +4038,7 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
             // Notify external listeners about the new tip.
             // Enqueue while holding cs_main to ensure that UpdatedBlockTip is called in the order in which blocks are connected
             if (this == &m_chainman.ActiveChainstate() && pindexFork != pindexNewTip) {
+                m_chainman.m_active_tip_changed = SteadyClock::now().time_since_epoch().count();
                 // Notify ValidationInterface subscribers
                 if (m_chainman.m_options.signals) {
                     m_chainman.m_options.signals->UpdatedBlockTip(pindexNewTip, pindexFork, still_in_ibd);
@@ -4089,6 +4092,8 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
         // caused an assert() failure during interrupt in such cases as the UTXO DB flushing checks
         // that the best block hash is non-null.
         if (m_chainman.m_interrupt) break;
+        // New blocks first: between historical blocks the background chainstate gives way to the active one.
+        if (is_background) m_chainman.BackgroundYield();
     } while (pindexNewTip != pindexMostWork);
 
     m_chainman.CheckBlockIndex();
@@ -5203,13 +5208,116 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
     }
 
     Chainstate* bg_chain{WITH_LOCK(cs_main, return BackgroundSyncInProgress() ? m_ibd_chainstate.get() : nullptr)};
-    BlockValidationState bg_state;
-    if (bg_chain && !bg_chain->ActivateBestChain(bg_state, block)) {
-        LogError("%s: [background] ActivateBestChain failed (%s)\n", __func__, bg_state.ToString());
-        return false;
-     }
+    if (bg_chain && m_bg_validation_running) {
+        // Hand the background chainstate's work to the "bgvalidation" thread so that this caller (normally the P2P
+        // message handler) returns to processing messages, including new tip blocks, right away.
+        {
+            LOCK(m_bg_validation_mutex);
+            m_bg_validation_pending = true;
+        }
+        m_bg_validation_cv.notify_one();
+    } else if (bg_chain) {
+        BlockValidationState bg_state;
+        if (!bg_chain->ActivateBestChain(bg_state, block)) {
+            LogError("%s: [background] ActivateBestChain failed (%s)\n", __func__, bg_state.ToString());
+            return false;
+        }
+    }
 
     return true;
+}
+
+void ChainstateManager::StartBackgroundValidation()
+{
+    LOCK(m_bg_validation_mutex);
+    if (m_bg_validation_thread.joinable()) return;
+    m_bg_validation_stop = false;
+    m_bg_validation_pending = true; // pick up anything already downloaded
+    m_bg_validation_thread = std::thread(&util::TraceThread, "bgvalidation", [this] { BackgroundValidationLoop(); });
+    m_bg_validation_running = true;
+}
+
+void ChainstateManager::StopBackgroundValidation()
+{
+    // From here on ProcessNewBlock() works inline again; both paths are serialized by the chainstate's
+    // m_chainstate_mutex inside ActivateBestChain().
+    m_bg_validation_running = false;
+    std::thread thread;
+    {
+        LOCK(m_bg_validation_mutex);
+        m_bg_validation_stop = true;
+        thread = std::move(m_bg_validation_thread);
+    }
+    m_bg_validation_cv.notify_all();
+    if (thread.joinable()) thread.join();
+}
+
+//! Set on the "bgvalidation" thread only: BackgroundYield() may wait there, never on a thread that could be the
+//! one that has to connect the newer block.
+static thread_local bool g_bgvalidation_thread{false};
+//! After the active tip moves: room for the new tip's block template (mining) and relay.
+static constexpr auto BG_YIELD_AFTER_TIP{std::chrono::seconds{10}};
+//! A newer header whose block does not arrive or connect stops holding the background chainstate back after this.
+static constexpr auto BG_YIELD_STALL{std::chrono::seconds{60}};
+static constexpr auto BG_YIELD_POLL{std::chrono::milliseconds{20}};
+
+void ChainstateManager::BackgroundYield()
+{
+    if (g_bgvalidation_thread) {
+        bool logged{false};
+        while (m_bg_validation_running && !m_interrupt) {
+            const auto now{SteadyClock::now()};
+            bool newer_block{false};
+            {
+                LOCK(::cs_main);
+                const CBlockIndex* tip{ActiveChain().Tip()};
+                const CBlockIndex* best{m_best_header};
+                if (tip && best && best->nChainWork > tip->nChainWork) {
+                    if (best != m_bg_yield_header || tip != m_bg_yield_tip) {
+                        m_bg_yield_header = best;
+                        m_bg_yield_tip = tip;
+                        m_bg_yield_since = now;
+                    }
+                    newer_block = now - m_bg_yield_since < BG_YIELD_STALL;
+                }
+            }
+            const auto changed{m_active_tip_changed.load()};
+            const bool settling{changed != 0 && now - SteadyClock::time_point{SteadyClock::duration{changed}} < BG_YIELD_AFTER_TIP};
+            if (!newer_block && !settling) break;
+            if (!logged) {
+                LogDebug(BCLog::VALIDATION, "[background validation] giving way to %s\n", newer_block ? "a newer block" : "the new tip");
+                logged = true;
+            }
+            std::this_thread::sleep_for(BG_YIELD_POLL);
+        }
+    }
+    // cs_main is not a fair lock: re-taking it right away for the next historical block can keep a waiting thread
+    // out for the whole backlog. Pause briefly so waiters get it first.
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+}
+
+void ChainstateManager::BackgroundValidationLoop()
+{
+    g_bgvalidation_thread = true;
+    while (true) {
+        {
+            WAIT_LOCK(m_bg_validation_mutex, lock);
+            // Wake on a request or on stop; the timeout only bounds how long a stop request can go unnoticed.
+            m_bg_validation_cv.wait_for(lock, std::chrono::seconds{1}, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_bg_validation_mutex) {
+                return m_bg_validation_pending || m_bg_validation_stop;
+            });
+            if (m_bg_validation_stop) return;
+            if (!m_bg_validation_pending) continue;
+            m_bg_validation_pending = false;
+        }
+        if (m_interrupt) return;
+        Chainstate* bg_chain{WITH_LOCK(::cs_main, return BackgroundSyncInProgress() ? m_ibd_chainstate.get() : nullptr)};
+        if (!bg_chain) continue;
+        BlockValidationState bg_state;
+        if (!bg_chain->ActivateBestChain(bg_state, nullptr)) {
+            LogError("[background] ActivateBestChain failed (%s)\n", bg_state.ToString());
+        }
+    }
 }
 
 MempoolAcceptResult ChainstateManager::ProcessTransaction(const CTransactionRef& tx, bool test_accept, const ignore_rejects_type& ignore_rejects)
@@ -7292,6 +7400,9 @@ bool ChainstateManager::IsSnapshotActive() const
     return m_snapshot_chainstate && m_active_chainstate == m_snapshot_chainstate.get();
 }
 
+//! Share of the coins caches the active chainstate keeps while a background chainstate validates history.
+static constexpr double ACTIVE_CACHE_SHARE_DURING_BG{1.0 / 3};
+
 void ChainstateManager::MaybeRebalanceCaches()
 {
     AssertLockHeld(::cs_main);
@@ -7320,10 +7431,13 @@ void ChainstateManager::MaybeRebalanceCaches()
             m_snapshot_chainstate->ResizeCoinsCaches(
                 m_total_coinstip_cache * 0.95, m_total_coinsdb_cache * 0.95);
         } else {
+            // The active chainstate is the one that relays, mines on and connects new blocks. With 5% it had ~50 MB
+            // on a 4 GB node, so mempool checks, new blocks and block templates read from a disk the background
+            // chainstate keeps busy. It keeps a third while the background chainstate catches up.
             m_snapshot_chainstate->ResizeCoinsCaches(
-                m_total_coinstip_cache * 0.05, m_total_coinsdb_cache * 0.05);
+                m_total_coinstip_cache * ACTIVE_CACHE_SHARE_DURING_BG, m_total_coinsdb_cache * ACTIVE_CACHE_SHARE_DURING_BG);
             m_ibd_chainstate->ResizeCoinsCaches(
-                m_total_coinstip_cache * 0.95, m_total_coinsdb_cache * 0.95);
+                m_total_coinstip_cache * (1 - ACTIVE_CACHE_SHARE_DURING_BG), m_total_coinsdb_cache * (1 - ACTIVE_CACHE_SHARE_DURING_BG));
         }
     }
 }
@@ -7359,6 +7473,7 @@ ChainstateManager::ChainstateManager(const util::SignalInterrupt& interrupt, Opt
 
 ChainstateManager::~ChainstateManager()
 {
+    StopBackgroundValidation();
     LOCK(::cs_main);
 
     m_versionbitscache.Clear();
