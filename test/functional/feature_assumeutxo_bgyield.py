@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise background assumeutxo yield, bounded header stall, stop, and normal sync."""
 import time
+from test_framework.authproxy import JSONRPCException
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 from test_framework.wallet import MiniWallet
@@ -11,16 +12,31 @@ BASE_HEIGHT = 299
 
 class BackgroundYieldTest(BitcoinTestFramework):
     def set_test_params(self):
-        self.num_nodes = 5
+        self.num_nodes = 6
         self.rpc_timeout = 120
-        self.extra_args = [["-debug=validation"] for _ in range(5)]
+        self.extra_args = [["-debug=validation"] for _ in range(6)]
 
     def setup_network(self):
-        self.add_nodes(5)
+        self.add_nodes(6)
         self.start_nodes(extra_args=self.extra_args)
 
+    def request_blocks(self, node, source, peer, first, last):
+        for h in range(first, last + 1):
+            block_hash = source.getblockhash(h)
+            try:
+                node.getblock(block_hash, 0)
+                continue
+            except JSONRPCException as exc:
+                if not any(msg in exc.error["message"] for msg in ("Block not found", "Block not available")):
+                    raise
+            try:
+                node.getblockfrompeer(block_hash, peer)
+            except JSONRPCException as exc:
+                if not any(msg in exc.error["message"] for msg in ("Block already downloaded", "Already requested")):
+                    raise
+
     def run_test(self):
-        source, stuck, normal, header_miner, stopping = self.nodes
+        source, stuck, normal, header_miner, stopping, restarting = self.nodes
         wallet = MiniWallet(source)
         # Identical 199->299 chain construction to feature_assumeutxo.py.
         for node in self.nodes:
@@ -43,9 +59,11 @@ class BackgroundYieldTest(BitcoinTestFramework):
             stuck.submitheader(raw)
             normal.submitheader(raw)
             stopping.submitheader(raw)
+            restarting.submitheader(raw)
         assert_equal(stuck.loadtxoutset(snap['path'])['base_height'], BASE_HEIGHT)
         assert_equal(normal.loadtxoutset(snap['path'])['base_height'], BASE_HEIGHT)
         assert_equal(stopping.loadtxoutset(snap['path'])['base_height'], BASE_HEIGHT)
+        assert_equal(restarting.loadtxoutset(snap['path'])['base_height'], BASE_HEIGHT)
         # As in feature_assumeutxo.py, the source must have a post-snapshot
         # continuation, otherwise it does not supply historical blocks.
         self.generate(source, nblocks=100, sync_fun=self.no_op)
@@ -54,6 +72,7 @@ class BackgroundYieldTest(BitcoinTestFramework):
             stuck.submitheader(raw)
             normal.submitheader(raw)
             stopping.submitheader(raw)
+            restarting.submitheader(raw)
         assert_equal(source.getblockcount(), BASE_HEIGHT + 100)
         # The header-miner receives all real blocks, then disconnects before
         # producing one header. The history source cannot serve its block.
@@ -65,6 +84,25 @@ class BackgroundYieldTest(BitcoinTestFramework):
         stuck.submitheader(header_miner.getblock(header_miner.getbestblockhash(), 0))
         stopping.submitheader(header_miner.getblock(header_miner.getbestblockhash(), 0))
         assert_equal(stuck.getblockchaininfo()['headers'], BASE_HEIGHT + 101)
+        self.log.info("Restart with incomplete background chainstate and remaining history on disk")
+        self.connect_nodes(0, 5)
+        restart_peer = restarting.getpeerinfo()[0]['id']
+        self.request_blocks(restarting, source, restart_peer, START_HEIGHT + 1, BASE_HEIGHT)
+        self.wait_until(
+            lambda: START_HEIGHT < restarting.getchainstates()['chainstates'][0]['blocks'] < BASE_HEIGHT,
+            timeout=60,
+        )
+        self.stop_node(5)
+        self.start_node(5, extra_args=self.extra_args[5])
+        restarting.getblockchaininfo()
+        restart_log = restarting.debug_log_path.read_text(errors="replace")
+        for unexpected in ("m_disabled", "Failed to connect best block"):
+            assert unexpected not in restart_log
+        self.wait_until(
+            lambda: len(restarting.getchainstates()['chainstates']) == 1
+            and restarting.getchainstates()['chainstates'][0]['validated'],
+            timeout=240,
+        )
         self.log.info("Yield and prompt stop with an unavailable newer block")
         with stopping.assert_debug_log(["[background validation] giving way to a newer block"]):
             self.connect_nodes(0, 4)
